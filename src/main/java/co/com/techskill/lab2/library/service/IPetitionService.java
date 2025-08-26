@@ -12,6 +12,7 @@ public interface IPetitionService {
     Flux<String> checkPriorities(PetitionDTO petitionDTO);
     //TO-DO
     Flux<String> processPetition(PetitionDTO petitionDTO);
+    Flux<String> peticionesReturn();
     Mono<String> simulateIntermittency(PetitionDTO petitionDTO);
 
 }

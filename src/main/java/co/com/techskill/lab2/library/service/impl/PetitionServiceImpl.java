@@ -6,8 +6,7 @@ import co.com.techskill.lab2.library.domain.dto.PetitionDTO;
 import co.com.techskill.lab2.library.repository.IBookRepository;
 import co.com.techskill.lab2.library.repository.IPetitionRepository;
 import co.com.techskill.lab2.library.service.IPetitionService;
-
-import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import co.com.techskill.lab2.library.service.dummy.PetitionService;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.reactor.circuitbreaker.operator.CircuitBreakerOperator;
 import org.springframework.stereotype.Service;
@@ -20,6 +19,7 @@ import java.time.LocalDate;
 import java.time.LocalTime;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 
 @Service
 public class PetitionServiceImpl implements IPetitionService {
@@ -27,25 +27,27 @@ public class PetitionServiceImpl implements IPetitionService {
     private final IPetitionRepository petitionRepository;
     private final IBookRepository bookRepository;
     private final PetitionMapper petitionMapper;
+    private final PetitionService petitionService;
+
+    private static final String TYPE="RETURN";
     CircuitBreaker circuitBreaker = CircuitBreaker.ofDefaults("petitionService");
 
-    public PetitionServiceImpl(IPetitionRepository petitionRepository, IBookRepository bookRepository) {
+    public PetitionServiceImpl(IPetitionRepository petitionRepository, IBookRepository bookRepository,PetitionService petitionService) {
         this.petitionRepository = petitionRepository;
         this.bookRepository = bookRepository;
         this.petitionMapper = new PetitionMapperImpl();
+        this.petitionService = petitionService;
     }
     @Override
     public Flux<PetitionDTO> findALl() {
-        return petitionRepository
-                .findAll()
-                .map(petitionMapper::toDTO);
+        return petitionService
+                .dummyFindAll();
     }
 
     @Override
     public Mono<PetitionDTO> findById(String id) {
-        return petitionRepository
-                .findByPetitionId(id)
-                .map(petitionMapper::toDTO);
+        return petitionService
+                .dummyFindById(id);
     }
 
     @Override
@@ -101,10 +103,61 @@ public class PetitionServiceImpl implements IPetitionService {
                 )
                 .timeout(Duration.ofSeconds(5))
                 .transformDeferred(CircuitBreakerOperator.of(circuitBreaker))
-                //.retryWhen(Retry.max(3).filter(e -> !(e instanceof CallNotPermittedException)))
-                .retry(1)
+                .retry(3)
                 .onErrorResume(e -> Mono.just("Petition failed: "+petitionDTO.getPetitionId() + " - " + e.getMessage()));
 
+    }
+    static class TransientFailure extends RuntimeException {
+        TransientFailure(String msg) { super(msg); }
+    }
+
+    @Override
+    public Flux<String> peticionesReturn() {
+        return findALl()
+                .filter(p -> TYPE.equalsIgnoreCase(p.getType()))
+                .flatMap(p ->
+                        reglasDeNegocio(p)
+                                .timeout(Duration.ofMillis(500))
+                                .retryWhen(
+                                        Retry.backoff(2, Duration.ofMillis(150))
+                                                .filter(ex ->
+                                                        ex instanceof PetitionServiceImpl.TransientFailure ||
+                                                                ex instanceof java.util.concurrent.TimeoutException
+                                                )
+                                ).timeout(Duration.ofSeconds(5))
+                                .transformDeferred(CircuitBreakerOperator.of(circuitBreaker))
+                                .onErrorResume(ex -> Mono.just(fallbackReturn(p, ex)))
+                );
+    }
+
+
+
+
+    private Mono<String> reglasDeNegocio(PetitionDTO p) {
+
+        if (p.getSentAt() != null && p.getSentAt().isBefore(LocalDate.now().minusDays(3))) {
+            return Mono.error(new IllegalStateException("RETURN expirada Mayor a 3 días)"));
+        }
+        int latency = ThreadLocalRandom.current().nextInt(100, 701);
+        boolean transientFail = ThreadLocalRandom.current().nextInt(100) < 15;
+
+        return Mono.defer(() -> transientFail
+                        ? Mono.<String>error(new PetitionServiceImpl.TransientFailure("Falla por latencia"))
+                        : Mono.just("RETURN OK id=%s t=%dms".formatted(p.getPetitionId(), latency)))
+                .delayElement(Duration.ofMillis(latency));
+    }
+
+    private String fallbackReturn(PetitionDTO p, Throwable ex) {
+        if (ex instanceof IllegalStateException) {
+            return "[FALLBACK] id=%s → Rechazada por plazo".formatted(p.getSentAt())+"\n";
+        }
+        if (ex instanceof java.util.concurrent.TimeoutException) {
+            return "[FALLBACK] id=%s → Timeout".formatted(p.getPetitionId())+"\n";
+        }
+        if (ex instanceof PetitionServiceImpl.TransientFailure) {
+            return "[FALLBACK] id=%s → Transitorio (reintentos agotados)".formatted(p.getPetitionId())+"\n";
+        }
+        return "[FALLBACK] id=%s → Error: %s".formatted(p.getPetitionId(), ex.getMessage())+"\n";
     }
 
 }
